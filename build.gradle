@@ -1,0 +1,244 @@
+import groovy.json.JsonSlurper
+import java.io.DataInputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.util.zip.ZipFile
+
+buildscript {
+    repositories {
+        maven { url = 'https://maven.minecraftforge.net/' }
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.anatawa12.forge:ForgeGradle:2.3-1.0.8'
+    }
+}
+
+apply plugin: 'net.minecraftforge.gradle.forge'
+
+group = 'io.github.onitofu.srpreconnaissance'
+version = modVersion
+archivesBaseName = 'srp-reconnaissance'
+sourceCompatibility = targetCompatibility = '1.8'
+
+ext {
+    minecraftVersion = '1.12.2'
+    forgeVersion = '14.23.5.2847'
+    checkstyleVersion = '14.3.0'
+    srpCoordinate = 'maven.modrinth:MJX7HTHx:sGgSorId'
+    srpSha256 = 'f803ab3882bc8047858a23e2376aaa8fb87d7e54a324b9183b4a033ee076ddea'
+    checkstyleSha256 = '754e218ab1fcabb1e1c5f8530e9d3aa37636806c22987bb279dd907a6ee749b2'
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+    }
+}
+
+minecraft {
+    version = "${project.minecraftVersion}-${project.forgeVersion}"
+    mappings = 'stable_39'
+    runDir = 'run'
+    makeObfSourceJar = false
+}
+
+dependencies {
+    deobfCompile srpCoordinate
+    testImplementation 'junit:junit:4.13.2'
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
+
+test {
+    systemProperty 'java.awt.headless', 'true'
+    workingDir = file("$buildDir/test-working")
+    doFirst {
+        workingDir.mkdirs()
+    }
+}
+
+processResources {
+    inputs.properties([
+        version: project.version,
+        minecraftVersion: minecraftVersion,
+        modId: modId,
+        modName: modName,
+        modAuthor: modAuthor
+    ])
+    filesMatching('mcmod.info') {
+        expand project.properties
+    }
+}
+
+jar {
+    manifest {
+        attributes(
+            'Implementation-Title': modName,
+            'Implementation-Version': project.version,
+            'Implementation-Vendor': modAuthor
+        )
+    }
+}
+
+task sourcesJar(type: Jar) {
+    classifier = 'sources'
+    from sourceSets.main.allSource
+}
+
+artifacts {
+    archives sourcesJar
+}
+
+def sha256 = { File input ->
+    MessageDigest digest = MessageDigest.getInstance('SHA-256')
+    input.withInputStream { stream ->
+        byte[] buffer = new byte[65536]
+        int count
+        while ((count = stream.read(buffer)) != -1) {
+            digest.update(buffer, 0, count)
+        }
+    }
+    digest.digest().encodeHex().toString()
+}
+
+task verifySrp {
+    group = 'verification'
+    description = 'Verify the exact upstream SRP 1.9.21 artifact used for compilation.'
+    inputs.files configurations.deobfCompile
+    doLast {
+        File dependency = configurations.deobfCompile.singleFile
+        if (sha256(dependency) != srpSha256) {
+            throw new GradleException('SRP dependency checksum does not match the pinned 1.9.21 artifact.')
+        }
+    }
+}
+
+compileJava.dependsOn verifySrp
+setupDecompWorkspace.dependsOn verifySrp
+
+def checkstyleJar = new File(
+    gradle.gradleUserHomeDir,
+    "caches/srp-reconnaissance/checkstyle/${checkstyleVersion}/checkstyle-${checkstyleVersion}-all.jar"
+)
+
+task prepareCheckstyle {
+    group = 'verification'
+    description = 'Download and verify the pinned standalone Checkstyle distribution.'
+    inputs.property 'version', checkstyleVersion
+    inputs.property 'sha256', checkstyleSha256
+    outputs.file checkstyleJar
+    outputs.upToDateWhen {
+        checkstyleJar.isFile() && sha256(checkstyleJar) == checkstyleSha256
+    }
+    doLast {
+        if (checkstyleJar.isFile() && sha256(checkstyleJar) == checkstyleSha256) {
+            return
+        }
+        if (gradle.startParameter.offline) {
+            throw new GradleException('Verified Checkstyle is not cached. Run prepareCheckstyle once without --offline.')
+        }
+        checkstyleJar.parentFile.mkdirs()
+        File temporary = File.createTempFile('checkstyle-', '.download', checkstyleJar.parentFile)
+        try {
+            URL url = new URL(
+                "https://github.com/checkstyle/checkstyle/releases/download/" +
+                    "checkstyle-${checkstyleVersion}/checkstyle-${checkstyleVersion}-all.jar"
+            )
+            URLConnection connection = url.openConnection()
+            connection.connectTimeout = 30000
+            connection.readTimeout = 120000
+            connection.setRequestProperty('User-Agent', 'srp-reconnaissance-build')
+            connection.inputStream.withCloseable { input ->
+                temporary.withOutputStream { output ->
+                    output << input
+                }
+            }
+            if (sha256(temporary) != checkstyleSha256) {
+                throw new GradleException('Checkstyle download checksum does not match the pinned release.')
+            }
+            Files.move(temporary.toPath(), checkstyleJar.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        } finally {
+            temporary.delete()
+        }
+    }
+}
+
+def lintJavaHome = findProperty('checkstyleJavaHome') ?: System.getenv('CHECKSTYLE_JAVA_HOME')
+
+sourceSets.matching { it.name in ['main', 'test'] }.all { sourceSet ->
+    task("checkstyle${sourceSet.name.capitalize()}", type: JavaExec, dependsOn: prepareCheckstyle) {
+        group = 'verification'
+        description = "Check ${sourceSet.name} Java sources against the TAAN style rules."
+        main = 'com.puppycrawl.tools.checkstyle.Main'
+        classpath = files(checkstyleJar)
+        inputs.files sourceSet.allJava
+        inputs.file 'checkstyle.xml'
+        inputs.property 'checkstyleVersion', checkstyleVersion
+        def report = file("$buildDir/reports/checkstyle/${sourceSet.name}.xml")
+        outputs.file report
+        onlyIf {
+            !sourceSet.allJava.empty
+        }
+        doFirst {
+            if (!lintJavaHome) {
+                throw new GradleException('Set CHECKSTYLE_JAVA_HOME or -PcheckstyleJavaHome to a Java 21+ installation.')
+            }
+            File java = new File(lintJavaHome.toString(), "bin/java${System.getProperty('os.name').startsWith('Windows') ? '.exe' : ''}")
+            if (!java.isFile()) {
+                throw new GradleException('The configured Checkstyle Java executable does not exist.')
+            }
+            executable = java.absolutePath
+            report.parentFile.mkdirs()
+            args = ['-c', file('checkstyle.xml').absolutePath, '-f', 'xml', '-o', report.absolutePath]
+            args += sourceSet.allJava.files.sort().collect { it.absolutePath }
+        }
+    }
+}
+
+task checkstyle(dependsOn: [checkstyleMain, checkstyleTest]) {
+    group = 'verification'
+    description = 'Run strict Checkstyle with Java 21+ while Forge builds on Java 8.'
+}
+
+check.dependsOn checkstyle
+
+task verifyArtifact(dependsOn: reobfJar) {
+    group = 'verification'
+    description = 'Verify release metadata, author, Java target and dependency isolation.'
+    inputs.file jar.archivePath
+    doLast {
+        new ZipFile(jar.archivePath).withCloseable { archive ->
+            def metadata = new JsonSlurper().parse(archive.getInputStream(archive.getEntry('mcmod.info')))
+            if (modAuthor != 'onitofu' || metadata.size() != 1 ||
+                metadata[0].modid != modId || metadata[0].name != modName ||
+                metadata[0].version != project.version.toString() || metadata[0].mcversion != minecraftVersion ||
+                metadata[0].authorList != [modAuthor] || metadata[0].dependencies != ['srparasites']) {
+                throw new GradleException('Release mod metadata is inconsistent with project identity or author.')
+            }
+            def entrypoint = archive.getEntry(
+                'io/github/onitofu/srpreconnaissance/bootstrap/ParasitesReconnaissanceAddon.class'
+            )
+            if (entrypoint == null) {
+                throw new GradleException('Release is missing its Forge entry point.')
+            }
+            new DataInputStream(archive.getInputStream(entrypoint)).withCloseable { input ->
+                input.readInt()
+                input.readUnsignedShort()
+                if (input.readUnsignedShort() != 52) {
+                    throw new GradleException('The mod must contain Java 8 bytecode.')
+                }
+            }
+            if (archive.entries().find { it.name.startsWith('com/dhanantry/') || it.name.endsWith('.jar') }) {
+                throw new GradleException('The release must not bundle SRP or other third-party JARs.')
+            }
+        }
+    }
+}
+
+check.dependsOn verifyArtifact

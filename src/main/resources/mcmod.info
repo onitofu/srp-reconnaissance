@@ -1,0 +1,11 @@
+[
+  {
+    "modid": "${modId}",
+    "name": "${modName}",
+    "description": "A standalone reconnaissance addon for Scape and Run: Parasites.",
+    "version": "${version}",
+    "mcversion": "${minecraftVersion}",
+    "authorList": ["${modAuthor}"],
+    "dependencies": ["srparasites"]
+  }
+]
